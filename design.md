@@ -144,6 +144,15 @@ At each depth, for the current candidate set:
 - **Indexing:** for every record, compute the deterministic blocking key(s) and store in a filterable field; compute and store the full embedding (all chunks) plus per-depth cumulative norms (for exact PDS-style bounds where wanted).
 - **Query:** resolve the blocking key → fetch the (small) in-block candidate set (ACORN-style filtering inside the index if available) → run the adaptive-depth loop, comparing query chunks against the precomputed DB chunks at matching depth.
 - **Why it pays:** query-side generation savings scale with throughput (every incoming record is a query); DB-side cost is amortized at index time. The deeper the encoder and the smaller the block, the better the economics.
+### 3.8 Inference-time batching and the straggler question
+
+Adaptive depth means each query consumes a different number of blocks, which interacts with how the encoder is batched on real hardware. This is an inference/serving concern, not a training one, but it determines whether the FLOP savings translate into wall-clock savings.
+
+- **Ragged / continuous batching.** Run a batch of queries through the depth loop together; at each depth, **gather only the still-active (not-yet-stopped) queries** into the next block and retire the rest. Naive fixed-batch inference would instead run the whole batch to max depth and throw the adaptive savings away — the gather is what preserves them. This is the same machinery as continuous batching in LLM serving, mapped onto variable *depth* instead of variable sequence length.
+- **The straggler, precisely.** A record that runs to depth *N* costs one full forward pass — exactly what the brute-force baseline pays for *every* record. So a straggler's own latency is bounded by the baseline per-record cost; you are never worse, only less better than the raw FLOP count implies. And unlike LLM serving, **depth is a small bounded constant** (12–24 blocks), so the tail is hard-capped — a straggler cannot run away. What is real is GPU under-utilization in the tail of a *closed* batch: as records retire early the batch thins, so the last few deep blocks run on a batch of 1–2. This waste is additive (a few thin blocks) and bounded, not multiplicative.
+- **Backfill dissolves it.** Don't run a closed batch — as deep stragglers occupy slots, feed freed slots with newly arriving queries starting at depth 1. The batch stays a mix of records at all depths, the device stays saturated, and a straggler stalls nothing; it just holds one slot longer while fresh records flow through the early blocks around it.
+- **The confidence head is also a scheduler.** `c_k` already predicts residual depth, so it doubles as a routing signal: **depth-bucket** queries with similar predicted depth into the same batch so the deep ones batch together instead of each dragging its own thin tail.
+- **Regime alignment.** The straggler concern and the regime-fit concern (§7, "Hardware throughput") are the same coin pointing the same way. Adaptivity wins wall-clock precisely where you *cannot* cheaply collapse work into one fat fused call — low-batch, latency-bound, or CPU/edge serving. That low-batch/CPU regime is exactly where the straggler tail evaporates (batch ≈ 1, no tail). The place the method wins is the place the concern disappears — which is also an argument for the C++/CPU production path (§8) being well-matched to the method.
 ---
  
 ## 4. Training
@@ -203,7 +212,8 @@ Hypothesis to test: *the optimal comparison window is wider than the training-ch
 ### 6.3 Metrics
  
 - **Primary:** recall @ forwarded-candidate-set size (the blocking-correct metric), as a frontier against compute.
-- **Compute / latency:** encoder FLOPs and wall-clock per query (the generation-bound axis); end-to-end including search.
+- **Compute / latency:** the **primary compute axis is per-record encoder FLOPs / blocks-computed** — implementation-independent, batch-independent, and immune to host-side orchestration overhead (this is the currency of the bandit-NN literature, §2.4, and the honest headline for the generation-bound claim). Report **wall-clock as a secondary realizability axis**, and always state *which serving model* a wall-clock number assumes (batch-1 latency vs. continuous-batching throughput, §3.8) — the two can differ by a lot and conflating them hides the straggler tax.
+- **Depth distribution (diagnostic):** the histogram of stopping depth across queries. The entire economics rides on this being heavily skewed early; the straggler severity (§3.8) is readable straight off its tail. Treat it as a headline diagnostic, not an afterthought — a flat or heavy-tailed histogram means neither FLOPs nor wall-clock will win.
 - **Storage:** index footprint (per-depth chunks + norms).
 - **Tail recall:** recall on the *ambiguous slice* as a function of stopping aggressiveness — **the headline figure.** The approach is most likely to fail here, so the evidence must be strongest here. Aggregate recall that looks good while tail recall frays = hidden failure a reviewer will assume.
 - **Head calibration:** predicted tail-effect vs. realized rank-flip, sliced by ambiguity. Tight even on the hard slice ⇒ the head is doing real work and the conformal floor rarely binds.
@@ -229,7 +239,8 @@ Put all stopping rules on the *same* trunk and compare their speed/recall fronti
 | **Head coverage gap** | Rare near-duplicates (structurally unusual) | Hard-pair mining (§4.3); conformal floor; rely on blocking's tolerance for forwarding ambiguous cases. |
 | **Heuristic vs. valid** | "Is the probability real?" | Conformal / risk-control wrapper with held-out calibration and a tunable recall guarantee. |
 | **Training instability** | Moving residual target, aux loss degrades embedding | Two-phase schedule with stop-gradient; careful loss weighting. |
-| **Hardware throughput** | Small candidate sets, SIMD/GPU eats full dot products cheaply | Restrict claims to the generation-bound regime; report the crossover; lean on deep encoders + small blocks where adaptivity wins. |
+| **Hardware throughput** | Small candidate sets, SIMD/GPU eats full dot products cheaply | Restrict claims to the generation-bound regime; report the crossover; lean on deep encoders + small blocks where adaptivity wins. Report per-record FLOPs (batch-independent) as the primary axis so the claim doesn't hinge on batch shape. |
+| **Batched-inference stragglers** | A query that runs to max depth thins a closed batch; deep blocks run under-utilized | Continuous batching with backfill + depth-bucketing via the confidence head (§3.8); depth is bounded so the tail is hard-capped; publish the depth histogram so the tax is visible, not hidden. |
 | **Chunks don't compose** | Independent/late chunks have incompatible scales or redundant info | Decorrelation penalty + per-chunk whitening; verify with the residual-loss ablation. |
 | **Lookahead tax** | Measuring the next increment costs a stage | Learned head predicts without computing; hybrid only measures near threshold. |
  
@@ -265,7 +276,10 @@ dare/
 └── tests/
 ```
  
-**Stack:** PyTorch for the encoder/heads; HuggingFace for the backbone init; FAISS and/or Qdrant for baseline search and the production index; standard ER benchmark loaders (py_entitymatching / DeepMatcher data). Keep the adaptive search loop in a tight, profiled module — its overhead must not eat the generation savings.
+**Stack.** Two tiers, deliberately separated:
+
+- **Research / measurement (M0–M5):** PyTorch end-to-end for the encoder, chunk readouts, and confidence/value heads; HuggingFace for backbone init; FAISS and/or Qdrant for baseline search and the index; standard ER benchmark loaders (py_entitymatching / DeepMatcher data). The adaptive search loop stays in Python here. Because the **primary frontier metric is per-record encoder FLOPs / blocks-computed** (§6.3) — implementation-independent and immune to host-side overhead — the Python round-trip between block forward and stopping decision does not pollute the headline result. Keep the loop in a tight, vectorized module (over both the candidate set and the in-flight query batch) and profile it, but here "tight" means *vectorized*, not *rewritten*.
+- **Production realizability (future, post-M5):** a no-Python-in-the-loop inference path to show the wall-clock crossover is real and pre-empt the "your wall-clock is just Python overhead" critique. The natural vehicle is **LibTorch (C++)** — it runs the same traced/scripted model and weights, so there is no architecture or training mismatch (train in Python, ship the loop in C++). Alternatives where portability or edge deployment matters: CUDA graphs + `torch.compile` (capture the per-step loop and keep stopping logic as on-device tensor ops, eliminating the host round-trip entirely), ONNX Runtime, or TensorRT. This tier owns the continuous-batching scheduler (§3.8); it is also where the method's wall-clock advantage is clearest, since the low-batch/CPU serving regime is the one adaptivity is built for.
  
 ### Milestones
  
@@ -275,6 +289,7 @@ dare/
 4. **M3 — confidence head:** train heads; calibration curves; head-vs-bandit-CI vs. measure-based stopping.
 5. **M4 — validity:** conformal wrapper; recall-guarantee knob; tail-recall headline figure.
 6. **M5 — sweeps + paper:** chunk/stride study, per-scheme study, stopping-rule study; write-up.
+7. **M6 — production path (LibTorch):** trace/script the trained encoder + heads to a no-Python-in-the-loop **LibTorch (C++)** inference path; implement the continuous-batching scheduler with backfill and head-driven depth-bucketing (§3.8); demonstrate the wall-clock crossover in the low-batch/CPU regime and report it against the FLOP frontier. (Realizability result, not a prerequisite for the paper's core claims.)
 ---
  
 ## 9. Summary
